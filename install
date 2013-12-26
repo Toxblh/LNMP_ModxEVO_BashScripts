@@ -1,0 +1,209 @@
+#!/bin/bash
+
+# MySQL root password
+ROOTPASS=' *** MYSQL PASSWORD *** '
+TIMEZONE='Europe/Moscow'
+
+MYSQLPASS=`< /dev/urandom tr -dc _A-Z-a-z-0-9 | head -c12`
+SFTPPASS=`< /dev/urandom tr -dc _A-Z-a-z-0-9 | head -c12`
+PASSWORD=`< /dev/urandom tr -dc _A-Z-a-z-0-9 | head -c12`
+
+##############
+
+echo "Enter username for site and database:"
+read USERNAME
+
+echo "Enter domain"
+read DOMAIN
+
+##############
+
+echo "Creating user and home directory..."
+useradd $USERNAME -m -G sftp -s "/bin/false" -d "/var/www/$USERNAME"
+if [ "$?" -ne 0 ]; then
+	echo "Can't add user"
+	exit 1
+fi
+echo $SFTPPASS > ./tmp
+echo $SFTPPASS >> ./tmp
+cat ./tmp | passwd $USERNAME
+rm ./tmp
+
+##############
+
+mkdir /var/backupwww/$USERNAME/
+mkdir /var/www/$USERNAME/www
+mkdir /var/www/$USERNAME/tmp
+mkdir /var/www/$USERNAME/logs
+mkdir /var/www/$USERNAME/backup
+chmod -R 755 /var/www/$USERNAME/
+chown -R $USERNAME:$USERNAME /var/www/$USERNAME/
+chown root:root /var/www/$USERNAME/
+
+echo "Creating vhost file..."
+echo "
+upstream backend-$USERNAME {server unix:/var/run/php5-$USERNAME.sock;}
+server {
+	listen				80;
+	server_name			$DOMAIN www.$DOMAIN;
+	root				/var/www/$USERNAME/www;
+	access_log			/var/www/$USERNAME/logs/access.log;
+	error_log			/var/www/$USERNAME/logs/error.log;
+	index				index.php index.html;
+	rewrite_log			on;
+	if (\$host != '$DOMAIN' ) {
+		rewrite			^/(.*)$  http://$DOMAIN/\$1  permanent;
+	}
+	location ~* ^/core/ {
+		deny			all;
+	}
+	location / {
+		try_files		\$uri \$uri/ @rewrite;
+	}
+	location /index.html {
+		rewrite			/ / permanent;
+	}
+
+	location ~ ^/(.*?)/index\.html$ {
+		rewrite			^/(.*?)/ /$1/ permanent;
+	}
+	location @rewrite {
+		rewrite			^/(.*)$ /index.php?q=\$1;
+	}
+	location ~ \.php$ {
+		include			fastcgi_params;
+		fastcgi_param	SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+		fastcgi_pass	backend-$USERNAME;
+	}
+	location ~* ^.+\.(jpg|jpeg|gif|css|png|js|ico|bmp)$ {
+	   access_log		off;
+	   expires			10d;
+	   break;
+	}
+	location ~ /\.ht {
+		deny			all;
+	}
+}
+" > /etc/nginx/sites-available/$USERNAME.conf
+ln -s /etc/nginx/sites-available/$USERNAME.conf /etc/nginx/sites-enabled/$USERNAME.conf
+
+##############
+
+echo "Creating php5-fpm config"
+
+echo "[$USERNAME]
+
+listen = /var/run/php5-$USERNAME.sock
+listen.mode = 0666
+user = $USERNAME
+group = $USERNAME
+chdir = /var/www/$USERNAME
+
+php_admin_value[upload_tmp_dir] = /var/www/$USERNAME/tmp
+php_admin_value[soap.wsdl_cache_dir] = /var/www/$USERNAME/tmp
+php_admin_value[upload_max_filesize] = 100M
+php_admin_value[post_max_size] = 100M
+php_admin_value[open_basedir] = /var/www/$USERNAME/
+php_admin_value[disable_functions] = exec,passthru,shell_exec,system,proc_open,popen,curl_multi_exec,parse_ini_file,show_source,stream_socket_client,stream_set_write_buffer,stream_socket_sendto,highlight_file,com_load_typelib
+php_admin_value[cgi.fix_pathinfo] = 0
+php_admin_value[date.timezone] = $TIMEZONE
+php_admin_value[apc.cache_by_default] = 0
+
+pm = dynamic
+pm.max_children = 5
+pm.start_servers = 1
+pm.min_spare_servers = 1
+pm.max_spare_servers = 2
+pm.max_requests = 10
+" > /etc/php5/fpm/pool.d/$USERNAME.conf
+
+#############
+
+echo "Reloading nginx"
+service nginx reload
+echo "Reloading php5-fpm"
+service php5-fpm reload
+
+##############
+
+echo "Creating database"
+
+Q1="CREATE DATABASE IF NOT EXISTS $USERNAME DEFAULT CHARACTER SET utf8 COLLATE utf8_unicode_ci;;"
+Q2="GRANT ALTER,DELETE,DROP,CREATE,INDEX,INSERT,SELECT,UPDATE,CREATE TEMPORARY TABLES,LOCK TABLES ON $USERNAME.* TO '$USERNAME'@'localhost' IDENTIFIED BY '$MYSQLPASS';"
+Q3="FLUSH PRIVILEGES;"
+SQL="${Q1}${Q2}${Q3}"
+
+mysql -uroot --password=$ROOTPASS -e "$SQL"
+
+echo "#!/bin/bash
+
+echo \"Set permissions for /var/www/$USERNAME/www...\";
+echo \"CHOWN files...\";
+chown -R $USERNAME:$USERNAME /var/www/$USERNAME/www
+find \"/var/www/$USERNAME/www\" -type d -exec chmod 0755 '{}' \;
+echo \"CHMOD files...\";
+find \"/var/www/$USERNAME/www\" -type f -exec chmod 0644 '{}' \;
+chmod -R 777 /var/www/$USERNAME/www/assets/cache
+chmod -R 777 /var/www/$USERNAME/www/assets/export
+chmod -R 777 /var/www/$USERNAME/www/assets/files
+chmod -R 777 /var/www/$USERNAME/www/assets/images
+chmod -R 777 /var/www/$USERNAME/www/assets/media
+if [ -d /var/www/$USERNAME/www/assets/galleries ]; then
+	chmod -R 777 /var/www/$USERNAME/www/assets/galleries
+fi
+" > /var/www/$USERNAME/chmod
+chmod +x /var/www/$USERNAME/chmod
+
+echo "#!/bin/bash
+sed -i 's|^\$database_user.=.*|\$database_user = '\"'\"'$USERNAME'\"'\"';|g' /var/www/$USERNAME/www/manager/includes/config.inc.php
+sed -i 's|^\$database_password.=.*|\$database_password = '\"'\"'$MYSQLPASS'\"'\"';|g' /var/www/$USERNAME/www/manager/includes/config.inc.php
+sed -i 's|^\$dbase.=.*|\$dbase = '\"'\"'\`$USERNAME\`'\"'\"';|g' /var/www/$USERNAME/www/manager/includes/config.inc.php
+" > /var/www/$USERNAME/updconf
+chmod +x /var/www/$USERNAME/updconf
+echo "Update config file generated!"
+
+curl --user *USER WEBDAV*:*PASSWORD* --request MKCOL  https://webdav.yandex.ru/backup/$USERNAME/
+echo 'Create Yandex directory backup'
+
+echo "#!/bin/bash
+DBHOST='localhost'
+DBUSER=\"$USERNAME\"
+DBPASS=\"$MYSQLPASS\"
+DBNAME=\"$USERNAME\"
+DBARC=\$DBNAME.sql.gz
+WEBDAVURL=\"https://webdav.yandex.ru/backup/$USERNAME/\"
+WEBDAVUSER=\"*USER WEBDAV*\"
+WEBDAVPASS=\"*PASS WEBDAV*\"
+SCRIPTDIR=\"/var/www/$USERNAME/backup/\"
+SCRDIR=\"/var/www/$USERNAME/www/\"
+SCRARC=\"$USERNAME.tar.gz\"
+ARCNAME=\"$USERNAME-\$(date '+%F(%H:%M)').tar\"
+ARCMAX=\"4\"
+cd \$SCRDIR
+tar cfz \$SCRIPTDIR\$SCRARC *
+cd \$SCRIPTDIR
+mysqldump -h\$DBHOST -u\$DBUSER -p\$DBPASS \$DBNAME | gzip > \$DBARC
+tar cf \$SCRIPTDIR\$ARCNAME \$SCRARC \$DBARC
+curl --user \$WEBDAVUSER:\$WEBDAVPASS -T \$ARCNAME \$WEBDAVURL -s
+rm *.gz
+ARCDELETE=\`ls -t *.tar | tail -n+\$ARCMAX\`
+if [[ \"\$ARCDELETE\" != \"\" ]]
+then
+curl --user \$WEBDAVUSER:\$WEBDAVPASS --request DELETE \$WEBDAVURL\$ARCDELETE -s
+ls -t *.tar | tail -n+\$ARCMAX | xargs rm -f
+fi
+echo 'Успешный бекап сайта '\$ARCNAME
+echo 'Успешное удаление '\$ARCDELETE
+" > /var/backupwww/$USERNAME/backup.sh
+chmod +x /var/backupwww/$USERNAME/backup.sh
+echo "BackUP Script generated!"
+
+echo "0 0 * * * root /var/backupwww/$USERNAME/backup.sh >> /home/logCron" >> /etc/crontab
+echo "Cron ON!"
+
+echo "Done. Please visit http://$DOMAIN/manager/ to login.
+Manager user: $USERNAME
+SFTP password: $SFTPPASS
+Mysql password: $MYSQLPASS" > /var/www/$USERNAME/pass.txt
+
+cat /var/www/$USERNAME/pass.txt
